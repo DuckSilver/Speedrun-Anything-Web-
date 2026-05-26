@@ -198,7 +198,7 @@ def main(page: ft.Page):
                         ),
                         ft.Container(expand=True),
                         ft.Row(
-                            [ft.Text("v1.6", size=12, color="grey500")],
+                            [ft.Text("v1.2", size=12, color="grey500")],
                             alignment=ft.MainAxisAlignment.END
                         )
                     ],
