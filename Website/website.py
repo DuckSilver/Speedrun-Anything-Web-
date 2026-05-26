@@ -5,12 +5,12 @@ import time
 import asyncio
 from datetime import datetime
 
-DATA_FILE = "../server_speedrun_data.json"
+DATA_FILE = "server_speedrun_data.json"
 
 # ==========================================
-# 1. THE GLOBAL BRAIN (MULTIPLAYER STATE)
+# 1. THE GLOBAL BRAIN (NOW WITH ROOMS!)
 # ==========================================
-# This dictionary lives on the server and is shared by ALL connected users.
+# Structure: {"RoomName": {"password": "123", "lists": {"ListName": {...}}}}
 global_app_data = {}
 
 
@@ -23,29 +23,6 @@ def load_server_data():
         except Exception:
             global_app_data = {}
 
-    # Migration Engine
-    for list_name, content in list(global_app_data.items()):
-        if isinstance(content, list):
-            global_app_data[list_name] = {"categories": {"General Tasks": content},
-                                          "leaderboards": {"timer": [], "clock": []}, "pinned": False}
-        elif isinstance(content, dict) and "categories" not in content:
-            global_app_data[list_name] = {"categories": content, "leaderboards": {"timer": [], "clock": []},
-                                          "pinned": False}
-
-        if "pinned" not in global_app_data[list_name]:
-            global_app_data[list_name]["pinned"] = False
-
-        for cat, tasks in global_app_data[list_name]["categories"].items():
-            for t in tasks:
-                if "weight" not in t: t["weight"] = 1.0
-                if "time_type" not in t: t["time_type"] = "duration"
-                if "date" not in t: t["date"] = ""
-
-        for mode in ["timer", "clock"]:
-            for entry in global_app_data[list_name]["leaderboards"][mode]:
-                if "task_times" not in entry:
-                    entry["task_times"] = {}
-
 
 def save_server_data():
     global global_app_data
@@ -56,7 +33,6 @@ def save_server_data():
         pass
 
 
-# Load the master data once when the server boots up
 load_server_data()
 
 
@@ -87,30 +63,39 @@ def main(page: ft.Page):
     page.title = "Collaborative Speedrun"
     page.window.width = 400
     page.window.height = 700
+    page.theme_mode = ft.ThemeMode.DARK
+
+    # User's Session Memory
+    page.current_room = None
+    page.current_view = "login"
 
     # ==========================================
-    # 2. THE WHISPER NETWORK (PUBSUB)
+    # 2. THE WHISPER NETWORK (ISOLATED ROOMS)
     # ==========================================
-    # This listens for any changes made by ANY user on the server
     def on_broadcast(message):
+        # Only refresh the screen if this user is inside the room that was just updated!
+        if message.get("room") != page.current_room:
+            return
+
         current_view = getattr(page, "current_view", None)
 
         if current_view == "main":
             show_main_page(is_sync=True)
         elif current_view and current_view.startswith("list:"):
             target_list = current_view.split(":", 1)[1]
-            if target_list in global_app_data:
+            if target_list in global_app_data[page.current_room]["lists"]:
                 show_list_mode(target_list, is_sync=True)
         elif current_view and current_view.startswith("speedrun:"):
             target_list = current_view.split(":", 1)[1]
-            if target_list in global_app_data:
+            if target_list in global_app_data[page.current_room]["lists"]:
                 page.update()
 
     page.pubsub.subscribe(on_broadcast)
 
     def trigger_global_sync():
         save_server_data()
-        page.pubsub.send_all("sync_request")
+        # Whisper to the network, attaching the specific room name
+        page.pubsub.send_all({"room": page.current_room})
 
     def calculate_progress(categories):
         total_weight = 0.0
@@ -124,19 +109,97 @@ def main(page: ft.Page):
         return completed_weight / total_weight if total_weight > 0 else 0.0
 
     # ==========================================
-    # 3. MAIN PAGE VIEW
+    # 3. THE LOBBY (LOGIN PAGE)
+    # ==========================================
+    def show_login_page():
+        page.current_view = "login"
+        page.current_room = None
+        page.controls.clear()
+
+        title = ft.Text("Speedrun Hub", size=40, weight=ft.FontWeight.BOLD, text_align=ft.TextAlign.CENTER)
+        subtitle = ft.Text("Join or create a shared room", color="grey500")
+
+        room_input = ft.TextField(label="Room Name", prefix_icon=ft.icons.MEETING_ROOM)
+        pass_input = ft.TextField(label="Password", password=True, can_reveal_password=True, prefix_icon=ft.icons.LOCK)
+        error_text = ft.Text("", color="red", visible=False)
+
+        def attempt_login(e):
+            r_name = room_input.value.strip()
+            r_pass = pass_input.value.strip()
+
+            if not r_name or not r_pass:
+                error_text.value = "Please enter both a Room Name and Password."
+                error_text.visible = True
+                page.update()
+                return
+
+            global global_app_data
+
+            # Room exists: Check password
+            if r_name in global_app_data:
+                if global_app_data[r_name]["password"] == r_pass:
+                    page.current_room = r_name
+                    show_main_page()
+                else:
+                    error_text.value = "Incorrect password for this room."
+                    error_text.visible = True
+                    page.update()
+            # Room does not exist: Create it!
+            else:
+                global_app_data[r_name] = {
+                    "password": r_pass,
+                    "lists": {}
+                }
+                save_server_data()
+                page.current_room = r_name
+                show_main_page()
+
+        join_btn = ft.ElevatedButton("Enter Room", bgcolor="blue", color="white", width=200, height=50,
+                                     on_click=attempt_login)
+
+        page.add(
+            ft.SafeArea(
+                content=ft.Column(
+                    [
+                        ft.Container(height=50),  # Spacer
+                        title,
+                        subtitle,
+                        ft.Container(height=30),
+                        room_input,
+                        pass_input,
+                        error_text,
+                        ft.Container(height=20),
+                        join_btn
+                    ],
+                    horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                ),
+                expand=True
+            )
+        )
+        page.update()
+
+    # ==========================================
+    # 4. MAIN PAGE VIEW (INSIDE A ROOM)
     # ==========================================
     def show_main_page(is_sync=False):
         page.current_view = "main"
         page.controls.clear()
 
-        header = ft.Text("Shared Checklists", size=30, weight=ft.FontWeight.BOLD)
-        new_list_input = ft.TextField(hint_text="Name a new list...", expand=True)
+        # Shortcut to this specific room's lists
+        room_lists = global_app_data[page.current_room]["lists"]
+
+        header = ft.Row([
+            ft.Text(f"Room: {page.current_room}", size=26, weight=ft.FontWeight.BOLD, expand=True),
+            ft.IconButton(icon=ft.icons.LOGOUT, tooltip="Leave Room", icon_color="red",
+                          on_click=lambda e: show_login_page())
+        ])
+
+        new_list_input = ft.TextField(hint_text="Name a new checklist...", expand=True)
 
         def add_list_clicked(e):
             name = new_list_input.value.strip()
-            if name and name not in global_app_data:
-                global_app_data[name] = {
+            if name and name not in room_lists:
+                room_lists[name] = {
                     "categories": {},
                     "leaderboards": {"timer": [], "clock": []},
                     "pinned": False
@@ -147,18 +210,16 @@ def main(page: ft.Page):
         lists_view = ft.ListView(expand=True, spacing=5)
 
         def handle_reorder(list_name, action):
-            global global_app_data
-
-            pinned = [k for k, v in global_app_data.items() if v.get("pinned", False)]
-            unpinned = [k for k, v in global_app_data.items() if not v.get("pinned", False)]
-            is_pinned = global_app_data[list_name].get("pinned", False)
+            pinned = [k for k, v in room_lists.items() if v.get("pinned", False)]
+            unpinned = [k for k, v in room_lists.items() if not v.get("pinned", False)]
+            is_pinned = room_lists[list_name].get("pinned", False)
 
             if action == "pin":
-                global_app_data[list_name]["pinned"] = True
+                room_lists[list_name]["pinned"] = True
                 unpinned.remove(list_name)
                 pinned.append(list_name)
             elif action == "unpin":
-                global_app_data[list_name]["pinned"] = False
+                room_lists[list_name]["pinned"] = False
                 pinned.remove(list_name)
                 unpinned.insert(0, list_name)
             elif action == "top":
@@ -176,17 +237,16 @@ def main(page: ft.Page):
                     unpinned.remove(list_name);
                     unpinned.append(list_name)
 
-            new_ordered_data = {k: global_app_data[k] for k in pinned + unpinned}
-
-            global_app_data.clear()
-            global_app_data.update(new_ordered_data)
+            new_ordered_data = {k: room_lists[k] for k in pinned + unpinned}
+            global_app_data[page.current_room]["lists"].clear()
+            global_app_data[page.current_room]["lists"].update(new_ordered_data)
             trigger_global_sync()
 
         def create_list_row(list_name):
-            is_pinned = global_app_data[list_name].get("pinned", False)
+            is_pinned = room_lists[list_name].get("pinned", False)
 
             def delete_list(e=None):
-                del global_app_data[list_name]
+                del room_lists[list_name]
                 trigger_global_sync()
 
             def rename_list(e=None):
@@ -194,8 +254,8 @@ def main(page: ft.Page):
 
                 def save_rename(e):
                     new_name = rename_input.value.strip()
-                    if new_name and new_name != list_name and new_name not in global_app_data:
-                        global_app_data[new_name] = global_app_data.pop(list_name)
+                    if new_name and new_name != list_name and new_name not in room_lists:
+                        room_lists[new_name] = room_lists.pop(list_name)
                         trigger_global_sync()
                     dialog.open = False
                     page.update()
@@ -251,10 +311,10 @@ def main(page: ft.Page):
             edit_btn = ft.Container(content=ft.Text("⋮", size=24, weight=ft.FontWeight.BOLD), tooltip="Options",
                                     on_click=open_options_menu, padding=10)
 
-            list_progress = calculate_progress(global_app_data[list_name]["categories"])
+            list_progress = calculate_progress(room_lists[list_name]["categories"])
             mini_prog_bar = ft.ProgressBar(value=list_progress, color="green", bgcolor="grey200")
 
-            lb_data = global_app_data[list_name]["leaderboards"]
+            lb_data = room_lists[list_name]["leaderboards"]
             best_t = f"Timer: {lb_data['timer'][0]['display']}" if lb_data["timer"] else ""
             best_c = f"Clock: {lb_data['clock'][0]['display']}" if lb_data["clock"] else ""
 
@@ -272,8 +332,8 @@ def main(page: ft.Page):
                 on_click=lambda e: show_list_mode(list_name)
             )
 
-        pinned_keys = [k for k, v in global_app_data.items() if v.get("pinned", False)]
-        unpinned_keys = [k for k, v in global_app_data.items() if not v.get("pinned", False)]
+        pinned_keys = [k for k, v in room_lists.items() if v.get("pinned", False)]
+        unpinned_keys = [k for k, v in room_lists.items() if not v.get("pinned", False)]
 
         for name in pinned_keys + unpinned_keys:
             lists_view.controls.append(create_list_row(name))
@@ -284,7 +344,7 @@ def main(page: ft.Page):
         page.update()
 
     # ==========================================
-    # 4. LIST MODE VIEW
+    # 5. LIST MODE VIEW
     # ==========================================
     def show_list_mode(list_name, is_sync=False):
         if not is_sync:
@@ -292,7 +352,9 @@ def main(page: ft.Page):
 
         page.current_view = f"list:{list_name}"
         page.controls.clear()
-        categories = global_app_data[list_name]["categories"]
+
+        room_lists = global_app_data[page.current_room]["lists"]
+        categories = room_lists[list_name]["categories"]
 
         header = ft.Row([
             ft.TextButton("← Back", on_click=lambda e: show_main_page()),
@@ -307,13 +369,6 @@ def main(page: ft.Page):
 
         cat_input = ft.TextField(hint_text="Add a new category...", expand=True)
         categories_view = ft.ListView(expand=True, spacing=10)
-
-        def update_live_progress():
-            new_prog = calculate_progress(categories)
-            header_prog_bar.value = new_prog
-            header_prog_text.value = f"{int(new_prog * 100)}%"
-            header_prog_bar.update()
-            header_prog_text.update()
 
         def create_category_tile(cat_name, cat_tasks):
             tasks_col = ft.Column()
@@ -362,7 +417,6 @@ def main(page: ft.Page):
                             ts = parts[0]
                     elif t.get("time_type") == "clock":
                         try:
-                            # FIXED THE TYPO HERE!
                             time_part, ampm_part = t["time"].split(" ")
                             ch, cm = time_part.split(":")
                             ampm = ampm_part
@@ -465,7 +519,6 @@ def main(page: ft.Page):
                     new_name = rename_cat_input.value.strip()
                     if new_name and new_name != cat_name and new_name not in categories:
                         categories[new_name] = categories.pop(cat_name)
-                        # Carry over expansion memory to the new name
                         if cat_name in page.expanded_categories:
                             page.expanded_categories.discard(cat_name)
                             page.expanded_categories.add(new_name)
@@ -500,7 +553,7 @@ def main(page: ft.Page):
                 if val:
                     cat_tasks.append(
                         {"text": val, "done": False, "time": "", "time_type": "duration", "date": "", "weight": 1.0})
-                    page.expanded_categories.add(cat_name)  # Ensure it stays open when adding
+                    page.expanded_categories.add(cat_name)
                     trigger_global_sync()
 
             add_task_btn = ft.ElevatedButton("Add Task", on_click=add_task)
@@ -509,7 +562,6 @@ def main(page: ft.Page):
             cat_title_row = ft.Row([cat_title_text, ft.TextButton("Edit", on_click=edit_category)],
                                    alignment=ft.MainAxisAlignment.SPACE_BETWEEN)
 
-            # THE FIX: Changed to expanded=(...)
             expansion_tile = ft.ExpansionTile(
                 title=cat_title_row,
                 controls=[tasks_col, ft.Row([task_input, add_task_btn])],
@@ -525,7 +577,7 @@ def main(page: ft.Page):
             val = cat_input.value.strip()
             if val and val not in categories:
                 categories[val] = []
-                page.expanded_categories.add(val)  # Pop the new category open automatically
+                page.expanded_categories.add(val)
                 trigger_global_sync()
 
         add_cat_btn = ft.ElevatedButton("New Category", on_click=add_category)
@@ -539,11 +591,7 @@ def main(page: ft.Page):
             radios = ft.RadioGroup(
                 content=ft.Column([
                     ft.Radio(value="timer", label="Timer Mode"),
-                    ft.Text("Highlights tasks in red that have not been completed by their set time.", color="grey400",
-                            size=12),
-                    ft.Divider(height=5, color="transparent"),
                     ft.Radio(value="clock", label="Clock Mode"),
-                    ft.Text("Hides (grays out) tasks until their starting time.", color="grey400", size=12),
                 ]),
                 value="timer",
                 on_change=radio_changed
@@ -570,7 +618,7 @@ def main(page: ft.Page):
             page.update()
 
         def open_leaderboard(e):
-            lb_data = global_app_data[list_name]["leaderboards"]
+            lb_data = room_lists[list_name]["leaderboards"]
 
             def create_tab_content(mode_key):
                 records = lb_data[mode_key]
@@ -581,7 +629,7 @@ def main(page: ft.Page):
                 lv = ft.ListView(spacing=5, expand=True)
                 for i, rec in enumerate(records):
                     def delete_rec(e, idx=i, mk=mode_key):
-                        global_app_data[list_name]["leaderboards"][mk].pop(idx)
+                        room_lists[list_name]["leaderboards"][mk].pop(idx)
                         trigger_global_sync()
                         dialog.open = False
                         page.update()
@@ -596,7 +644,7 @@ def main(page: ft.Page):
                     lv.controls.append(row)
 
                 def delete_all(e, mk=mode_key):
-                    global_app_data[list_name]["leaderboards"][mk] = []
+                    room_lists[list_name]["leaderboards"][mk] = []
                     trigger_global_sync()
                     dialog.open = False
                     page.update()
@@ -645,18 +693,20 @@ def main(page: ft.Page):
              ft.Row([lb_btn, speedrun_btn], alignment=ft.MainAxisAlignment.CENTER)], expand=True), expand=True))
 
     # ==========================================
-    # 5. SPEEDRUN EXECUTION MODE
+    # 6. SPEEDRUN EXECUTION MODE
     # ==========================================
     def show_speedrun_mode(list_name, categories, mode, show_avg, show_best):
         page.current_view = f"speedrun:{list_name}"
         page.controls.clear()
+
+        room_lists = global_app_data[page.current_room]["lists"]
 
         speedrun_state = {"active": True, "completed": False}
         global_start_time = time.time()
         current_run_task_times = {}
 
         def get_pace_text(task_text):
-            lb = global_app_data[list_name]["leaderboards"][mode]
+            lb = room_lists[list_name]["leaderboards"][mode]
             if not lb: return ""
             times = [entry["task_times"][task_text] for entry in lb if
                      "task_times" in entry and task_text in entry["task_times"]]
@@ -719,7 +769,7 @@ def main(page: ft.Page):
 
             entry = {"sort_val": sort_val, "display": final_time_str, "date": today_str,
                      "task_times": current_run_task_times}
-            lb = global_app_data[list_name]["leaderboards"][mode]
+            lb = room_lists[list_name]["leaderboards"][mode]
             lb.append(entry)
             lb.sort(key=lambda x: x["sort_val"])
             trigger_global_sync()
@@ -752,7 +802,7 @@ def main(page: ft.Page):
                         if e.control.value:
                             current_run_task_times[task_dict["text"]] = int(time.time() - global_start_time)
 
-                        trigger_global_sync()  # Whisper to everyone that a box was checked!
+                        trigger_global_sync()
 
                         new_prog = calculate_progress(categories)
                         speedrun_prog_bar.value = new_prog
@@ -773,7 +823,6 @@ def main(page: ft.Page):
                 tasks_col.controls.append(task_row)
                 active_ui_refs.append((t, task_row, task_text))
 
-            # Ensure speedrun view categories are always expanded
             cat_tile = ft.ExpansionTile(title=ft.Text(cat_name, size=18, weight=ft.FontWeight.BOLD),
                                         controls=[tasks_col], expanded=True)
             speedrun_view.controls.append(cat_tile)
@@ -828,12 +877,11 @@ def main(page: ft.Page):
 
         page.run_task(timer_loop)
 
-    # Boot up the Main Page
-    show_main_page()
+    # Boot up the Login Page instead of the Main Page
+    show_login_page()
 
 
 # Launching as a Web Server!
 if __name__ == "__main__":
-    # Ask the cloud server for a port, but default to 8550 if running locally
     port = int(os.environ.get("PORT", 8550))
     ft.app(target=main, view=ft.AppView.WEB_BROWSER, port=port, host="0.0.0.0")
