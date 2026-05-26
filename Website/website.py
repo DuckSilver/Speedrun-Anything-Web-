@@ -5,12 +5,16 @@ import time
 import asyncio
 from datetime import datetime
 
+# Set up permanent folders for the Import/Export engine
 DATA_FILE = "server_speedrun_data.json"
+ASSETS_DIR = "assets"
+UPLOAD_DIR = "uploads"
+os.makedirs(ASSETS_DIR, exist_ok=True)
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 # ==========================================
 # 1. THE GLOBAL BRAIN (NOW WITH ROOMS!)
 # ==========================================
-# Structure: {"RoomName": {"password": "123", "lists": {"ListName": {...}}}}
 global_app_data = {}
 
 
@@ -73,12 +77,10 @@ def main(page: ft.Page):
     # 2. THE WHISPER NETWORK (ISOLATED ROOMS)
     # ==========================================
     def on_broadcast(message):
-        # Only refresh the screen if this user is inside the room that was just updated!
         if message.get("room") != page.current_room:
             return
 
         current_view = getattr(page, "current_view", None)
-
         if current_view == "main":
             show_main_page(is_sync=True)
         elif current_view and current_view.startswith("list:"):
@@ -94,7 +96,6 @@ def main(page: ft.Page):
 
     def trigger_global_sync():
         save_server_data()
-        # Whisper to the network, attaching the specific room name
         page.pubsub.send_all({"room": page.current_room})
 
     def calculate_progress(categories):
@@ -119,8 +120,8 @@ def main(page: ft.Page):
         title = ft.Text("Speedrun Hub", size=40, weight=ft.FontWeight.BOLD, text_align=ft.TextAlign.CENTER)
         subtitle = ft.Text("Join or create a shared room", color="grey500")
 
-        room_input = ft.TextField(label="Room Name", prefix_icon=ft.icons.MEETING_ROOM)
-        pass_input = ft.TextField(label="Password", password=True, can_reveal_password=True, prefix_icon=ft.icons.LOCK)
+        room_input = ft.TextField(label="🚪 Room Name")
+        pass_input = ft.TextField(label="🔒 Password", password=True, can_reveal_password=True)
         error_text = ft.Text("", color="red", visible=False)
 
         def attempt_login(e):
@@ -135,7 +136,6 @@ def main(page: ft.Page):
 
             global global_app_data
 
-            # Room exists: Check password
             if r_name in global_app_data:
                 if global_app_data[r_name]["password"] == r_pass:
                     page.current_room = r_name
@@ -144,7 +144,6 @@ def main(page: ft.Page):
                     error_text.value = "Incorrect password for this room."
                     error_text.visible = True
                     page.update()
-            # Room does not exist: Create it!
             else:
                 global_app_data[r_name] = {
                     "password": r_pass,
@@ -161,17 +160,32 @@ def main(page: ft.Page):
             ft.SafeArea(
                 content=ft.Column(
                     [
-                        ft.Container(height=50),  # Spacer
-                        title,
-                        subtitle,
-                        ft.Container(height=30),
-                        room_input,
-                        pass_input,
-                        error_text,
-                        ft.Container(height=20),
-                        join_btn
+                        ft.Container(expand=True),
+                        ft.Row(
+                            [
+                                ft.Column(
+                                    [
+                                        title,
+                                        subtitle,
+                                        ft.Container(height=30),
+                                        room_input,
+                                        pass_input,
+                                        error_text,
+                                        ft.Container(height=20),
+                                        join_btn
+                                    ],
+                                    horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                                )
+                            ],
+                            alignment=ft.MainAxisAlignment.CENTER
+                        ),
+                        ft.Container(expand=True),
+                        ft.Row(
+                            [ft.Text("v1.2", size=12, color="grey500")],
+                            alignment=ft.MainAxisAlignment.END
+                        )
                     ],
-                    horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                    expand=True
                 ),
                 expand=True
             )
@@ -185,13 +199,11 @@ def main(page: ft.Page):
         page.current_view = "main"
         page.controls.clear()
 
-        # Shortcut to this specific room's lists
         room_lists = global_app_data[page.current_room]["lists"]
 
         header = ft.Row([
             ft.Text(f"Room: {page.current_room}", size=26, weight=ft.FontWeight.BOLD, expand=True),
-            ft.IconButton(icon=ft.icons.LOGOUT, tooltip="Leave Room", icon_color="red",
-                          on_click=lambda e: show_login_page())
+            ft.TextButton("🚪 Leave Room", on_click=lambda e: show_login_page())
         ])
 
         new_list_input = ft.TextField(hint_text="Name a new checklist...", expand=True)
@@ -206,7 +218,63 @@ def main(page: ft.Page):
                 }
                 trigger_global_sync()
 
+        def open_import_dialog(e):
+            name_input = ft.TextField(label="New List Name", value="Imported List")
+            import_input = ft.TextField(label="Paste copied list data here...", multiline=True, min_lines=5,
+                                        max_lines=8)
+            import_error = ft.Text("", color="red", visible=False)
+
+            def process_import(ev):
+                list_name = name_input.value.strip() or "Imported List"
+                raw_text = import_input.value.strip()
+
+                if list_name in room_lists:
+                    import_error.value = "A list with this name already exists in this room."
+                    import_error.visible = True
+                    dialog.update()
+                    return
+
+                if not raw_text:
+                    import_error.value = "Please paste the list data."
+                    import_error.visible = True
+                    dialog.update()
+                    return
+
+                try:
+                    imported_data = json.loads(raw_text)
+                    if "categories" in imported_data:
+                        room_lists[list_name] = imported_data
+                        trigger_global_sync()
+                        dialog.open = False
+                        page.update()
+                    else:
+                        import_error.value = "This does not look like valid Speedrun data."
+                        import_error.visible = True
+                        dialog.update()
+                except Exception:
+                    import_error.value = "Invalid format. Make sure you copied the entire block of text."
+                    import_error.visible = True
+                    dialog.update()
+
+            dialog = ft.AlertDialog(
+                title=ft.Text("📂 Import List"),
+                content=ft.Column([
+                    name_input,
+                    import_input,
+                    import_error
+                ], tight=True),
+                actions=[
+                    ft.TextButton("Cancel", on_click=lambda _: [setattr(dialog, 'open', False), page.update()]),
+                    ft.ElevatedButton("Import", bgcolor="blue", color="white", on_click=process_import)
+                ]
+            )
+            page.overlay.append(dialog)
+            dialog.open = True
+            page.update()
+
         add_btn = ft.ElevatedButton("Create", on_click=add_list_clicked)
+        import_btn = ft.ElevatedButton("📂 Import", bgcolor="grey800", color="white", on_click=open_import_dialog)
+
         lists_view = ft.ListView(expand=True, spacing=5)
 
         def handle_reorder(list_name, action):
@@ -282,25 +350,52 @@ def main(page: ft.Page):
                         rename_list()
                     elif action == "delete":
                         delete_list()
+                    elif action == "export":
+                        # THE FIX: Explicit Export Dialog to bypass Browser Clipboard security
+                        json_str = json.dumps(room_lists[list_name])
+                        export_input = ft.TextField(value=json_str, multiline=True, min_lines=5, max_lines=8,
+                                                    read_only=True, label="Raw Data")
+
+                        def try_auto_copy(ev):
+                            page.clipboard.set(json_str)
+                            snack = ft.SnackBar(ft.Text(f"Attempted to copy '{list_name}' to clipboard!"))
+                            page.overlay.append(snack)
+                            snack.open = True
+                            export_dialog.open = False
+                            page.update()
+
+                        export_dialog = ft.AlertDialog(
+                            title=ft.Text("📋 Export List"),
+                            content=ft.Column([
+                                ft.Text(
+                                    "If the Auto-Copy button fails, manually highlight and copy (Ctrl+C) the text below:",
+                                    size=12, color="grey400"),
+                                export_input
+                            ], tight=True),
+                            actions=[
+                                ft.TextButton("Close", on_click=lambda _: [setattr(export_dialog, 'open', False),
+                                                                           page.update()]),
+                                ft.ElevatedButton("Auto-Copy", bgcolor="blue", color="white", on_click=try_auto_copy)
+                            ]
+                        )
+                        page.overlay.append(export_dialog)
+                        export_dialog.open = True
+                        page.update()
                     else:
                         handle_reorder(list_name, action)
 
                 menu_dialog = ft.AlertDialog(
                     title=ft.Text(f"Options", size=20, weight=ft.FontWeight.BOLD),
                     content=ft.Column([
-                        ft.ListTile(leading=ft.Text("📌", size=20),
-                                    title=ft.Text("Unpin List" if is_pinned else "Pin List"),
-                                    on_click=lambda _: execute_action("unpin" if is_pinned else "pin")),
-                        ft.ListTile(leading=ft.Text("⬆️", size=20), title=ft.Text("Move to Top"),
-                                    on_click=lambda _: execute_action("top")),
-                        ft.ListTile(leading=ft.Text("⬇️", size=20), title=ft.Text("Move to Bottom"),
-                                    on_click=lambda _: execute_action("bottom")),
-                        ft.Divider(),
-                        ft.ListTile(leading=ft.Text("✏️", size=20), title=ft.Text("Rename List"),
-                                    on_click=lambda _: execute_action("rename")),
-                        ft.ListTile(leading=ft.Text("🗑️", size=20), title=ft.Text("Delete List", color="red"),
-                                    on_click=lambda _: execute_action("delete")),
-                    ], tight=True),
+                        ft.TextButton("📌 Pin/Unpin List",
+                                      on_click=lambda _: execute_action("unpin" if is_pinned else "pin")),
+                        ft.TextButton("⬆️ Move to Top", on_click=lambda _: execute_action("top")),
+                        ft.TextButton("⬇️ Move to Bottom", on_click=lambda _: execute_action("bottom")),
+                        ft.Divider(height=5),
+                        ft.TextButton("✏️ Rename List", on_click=lambda _: execute_action("rename")),
+                        ft.TextButton("📋 Copy List Data", on_click=lambda _: execute_action("export")),
+                        ft.TextButton("🗑️ Delete List", icon_color="red", on_click=lambda _: execute_action("delete")),
+                    ], tight=True, alignment=ft.MainAxisAlignment.START),
                     actions=[ft.TextButton("Cancel",
                                            on_click=lambda _: [setattr(menu_dialog, 'open', False), page.update()])]
                 )
@@ -339,8 +434,8 @@ def main(page: ft.Page):
             lists_view.controls.append(create_list_row(name))
 
         page.add(ft.SafeArea(
-            content=ft.Column([header, ft.Row([new_list_input, add_btn]), ft.Divider(), lists_view], expand=True),
-            expand=True))
+            content=ft.Column([header, ft.Row([new_list_input, add_btn, import_btn]), ft.Divider(), lists_view],
+                              expand=True), expand=True))
         page.update()
 
     # ==========================================
@@ -369,6 +464,13 @@ def main(page: ft.Page):
 
         cat_input = ft.TextField(hint_text="Add a new category...", expand=True)
         categories_view = ft.ListView(expand=True, spacing=10)
+
+        def update_live_progress():
+            new_prog = calculate_progress(categories)
+            header_prog_bar.value = new_prog
+            header_prog_text.value = f"{int(new_prog * 100)}%"
+            header_prog_bar.update()
+            header_prog_text.update()
 
         def create_category_tile(cat_name, cat_tasks):
             tasks_col = ft.Column()
@@ -591,7 +693,11 @@ def main(page: ft.Page):
             radios = ft.RadioGroup(
                 content=ft.Column([
                     ft.Radio(value="timer", label="Timer Mode"),
+                    ft.Text("Highlights tasks in red that have not been completed by their set time.", color="grey400",
+                            size=12),
+                    ft.Divider(height=5, color="transparent"),
                     ft.Radio(value="clock", label="Clock Mode"),
+                    ft.Text("Hides (grays out) tasks until their starting time.", color="grey400", size=12),
                 ]),
                 value="timer",
                 on_change=radio_changed
@@ -705,6 +811,21 @@ def main(page: ft.Page):
         global_start_time = time.time()
         current_run_task_times = {}
 
+        def format_time_val(val_sec, mode_type):
+            m, s = divmod(int(val_sec), 60)
+            h, m = divmod(m, 60)
+            if mode_type == "timer":
+                return f"{h:01d}:{m:02d}:{s:02d}"
+            else:
+                am_pm = "AM"
+                if h >= 12:
+                    am_pm = "PM"
+                    if h > 12:
+                        h -= 12
+                if h == 0:
+                    h = 12
+                return f"{h}:{m:02d}:{s:02d} {am_pm}"
+
         def get_pace_text(task_text):
             lb = room_lists[list_name]["leaderboards"][mode]
             if not lb: return ""
@@ -715,15 +836,11 @@ def main(page: ft.Page):
             pace_parts = []
             if show_avg:
                 avg = sum(times) / len(times)
-                m, s = divmod(int(avg), 60);
-                h, m = divmod(m, 60)
-                pace_parts.append(f"Avg: {h:01d}:{m:02d}:{s:02d}")
+                pace_parts.append(f"Avg: {format_time_val(avg, mode)}")
 
             if show_best:
                 best = min(times)
-                m, s = divmod(int(best), 60);
-                h, m = divmod(m, 60)
-                pace_parts.append(f"Best: {h:01d}:{m:02d}:{s:02d}")
+                pace_parts.append(f"Best: {format_time_val(best, mode)}")
 
             return " | ".join(pace_parts)
 
@@ -800,7 +917,12 @@ def main(page: ft.Page):
                     def toggle(e):
                         task_dict["done"] = e.control.value
                         if e.control.value:
-                            current_run_task_times[task_dict["text"]] = int(time.time() - global_start_time)
+                            if mode == "timer":
+                                current_run_task_times[task_dict["text"]] = int(time.time() - global_start_time)
+                            else:
+                                now_t = datetime.now()
+                                current_run_task_times[
+                                    task_dict["text"]] = now_t.hour * 3600 + now_t.minute * 60 + now_t.second
 
                         trigger_global_sync()
 
@@ -877,11 +999,11 @@ def main(page: ft.Page):
 
         page.run_task(timer_loop)
 
-    # Boot up the Login Page instead of the Main Page
     show_login_page()
 
 
 # Launching as a Web Server!
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8550))
-    ft.app(target=main, view=ft.AppView.WEB_BROWSER, port=port, host="0.0.0.0")
+    ft.app(target=main, view=ft.AppView.WEB_BROWSER, port=port, host="0.0.0.0", assets_dir=ASSETS_DIR,
+           upload_dir=UPLOAD_DIR)
