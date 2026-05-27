@@ -21,8 +21,8 @@ global_app_data = {}
 MONGO_URI = "mongodb+srv://Duckd:QFTPHdUCsIvLzVCT@speedruncluster.nf8tuia.mongodb.net/?appName=SpeedrunCluster"
 try:
     client = MongoClient(MONGO_URI)
-    db = client["speedrun_database"]  # Creates a database
-    collection = db["save_data"]  # Creates a collection (folder) inside it
+    db = client["speedrun_database"]
+    collection = db["save_data"]
 except Exception as e:
     print(f"Database connection error: {e}")
 
@@ -30,7 +30,6 @@ except Exception as e:
 def load_server_data():
     global global_app_data
     try:
-        # Ask MongoDB for the master save file
         document = collection.find_one({"_id": "master_save"})
         if document and "data" in document:
             global_app_data = document["data"]
@@ -43,17 +42,15 @@ def load_server_data():
 def save_server_data():
     global global_app_data
     try:
-        # Overwrite the master save file in MongoDB with the newest data
         collection.update_one(
             {"_id": "master_save"},
             {"$set": {"data": global_app_data}},
-            upsert=True  # If the file doesn't exist yet, create it!
+            upsert=True
         )
     except Exception:
         pass
 
 
-# Pull the data from the cloud when the server turns on
 load_server_data()
 
 
@@ -80,7 +77,8 @@ def parse_clock(time_str):
             return None
 
 
-def main(page: ft.Page):
+# THE FIX: 'main' is now an asynchronous function to support waiting for browser storage
+async def main(page: ft.Page):
     page.title = "Collaborative Speedrun"
     page.window.width = 400
     page.window.height = 700
@@ -89,6 +87,34 @@ def main(page: ft.Page):
     # User's Session Memory
     page.current_room = None
     page.current_view = "login"
+
+    # THE FIX: Storage wrappers are now async and use 'await'
+    async def safe_set_cookie(key, value):
+        try:
+            if hasattr(page, "shared_preferences"):
+                await page.shared_preferences.set(key, value)
+            elif hasattr(page, "client_storage"):
+                page.client_storage.set(key, value)
+        except Exception:
+            pass
+
+    async def safe_get_cookie(key):
+        try:
+            if hasattr(page, "shared_preferences"):
+                return await page.shared_preferences.get(key)
+            elif hasattr(page, "client_storage"):
+                return page.client_storage.get(key)
+        except Exception:
+            return None
+
+    async def safe_remove_cookie(key):
+        try:
+            if hasattr(page, "shared_preferences"):
+                await page.shared_preferences.remove(key)
+            elif hasattr(page, "client_storage"):
+                page.client_storage.remove(key)
+        except Exception:
+            pass
 
     # ==========================================
     # 2. THE WHISPER NETWORK (ISOLATED ROOMS)
@@ -141,7 +167,8 @@ def main(page: ft.Page):
         pass_input = ft.TextField(label="🔒 Password", password=True, can_reveal_password=True)
         error_text = ft.Text("", color="red", visible=False)
 
-        def attempt_login(e):
+        # THE FIX: Button clicks that deal with storage must also be async
+        async def attempt_login(e):
             r_name = room_input.value.strip()
             r_pass = pass_input.value.strip()
 
@@ -155,6 +182,9 @@ def main(page: ft.Page):
 
             if r_name in global_app_data:
                 if global_app_data[r_name]["password"] == r_pass:
+                    await safe_set_cookie("current_room", r_name)
+                    await safe_set_cookie("room_password", r_pass)
+
                     page.current_room = r_name
                     show_main_page()
                 else:
@@ -167,6 +197,10 @@ def main(page: ft.Page):
                     "lists": {}
                 }
                 save_server_data()
+
+                await safe_set_cookie("current_room", r_name)
+                await safe_set_cookie("room_password", r_pass)
+
                 page.current_room = r_name
                 show_main_page()
 
@@ -198,7 +232,7 @@ def main(page: ft.Page):
                         ),
                         ft.Container(expand=True),
                         ft.Row(
-                            [ft.Text("v1.2", size=12, color="grey500")],
+                            [ft.Text("v1.2.1", size=12, color="grey500")],
                             alignment=ft.MainAxisAlignment.END
                         )
                     ],
@@ -218,9 +252,15 @@ def main(page: ft.Page):
 
         room_lists = global_app_data[page.current_room]["lists"]
 
+        # THE FIX: Logout must be async too
+        async def leave_room(e):
+            await safe_remove_cookie("current_room")
+            await safe_remove_cookie("room_password")
+            show_login_page()
+
         header = ft.Row([
             ft.Text(f"Room: {page.current_room}", size=26, weight=ft.FontWeight.BOLD, expand=True),
-            ft.TextButton("🚪 Leave Room", on_click=lambda e: show_login_page())
+            ft.TextButton("🚪 Leave Room", on_click=leave_room)
         ])
 
         new_list_input = ft.TextField(hint_text="Name a new checklist...", expand=True)
@@ -373,7 +413,10 @@ def main(page: ft.Page):
                                                     read_only=True, label="Raw Data")
 
                         def try_auto_copy(ev):
-                            page.clipboard.set(json_str)
+                            try:
+                                page.clipboard.set(json_str)
+                            except Exception:
+                                pass
                             snack = ft.SnackBar(ft.Text(f"Attempted to copy '{list_name}' to clipboard!"))
                             page.overlay.append(snack)
                             snack.open = True
@@ -556,10 +599,10 @@ def main(page: ft.Page):
                                       visible=(t.get("time_type") == "clock"))
 
                 def on_type_change(e):
-                    is_dur = (type_dropdown.value == "duration")
+                    is_dur = (e.control.value == "duration")
                     timer_row.visible = is_dur
                     clock_col.visible = not is_dur
-                    dialog.update()
+                    page.update()
 
                 type_dropdown.on_change = on_type_change
 
@@ -571,7 +614,9 @@ def main(page: ft.Page):
 
                 def save_task_edit(e):
                     t["text"] = edit_task_input.value.strip() or t["text"]
+
                     t["time_type"] = type_dropdown.value
+
                     if t["time_type"] == "duration":
                         t[
                             "time"] = f"{safe_int(timer_h.value)}:{safe_int(timer_m.value):02d}:{safe_int(timer_s.value):02d}"
@@ -1015,7 +1060,15 @@ def main(page: ft.Page):
 
         page.run_task(timer_loop)
 
-    show_login_page()
+    # THE FIX: We now carefully wait for the browser cookies before trying to check them
+    saved_room = await safe_get_cookie("current_room")
+    saved_pass = await safe_get_cookie("room_password")
+
+    if saved_room and saved_room in global_app_data and global_app_data[saved_room].get("password") == saved_pass:
+        page.current_room = saved_room
+        show_main_page()
+    else:
+        show_login_page()
 
 
 # Launching as a Web Server!
